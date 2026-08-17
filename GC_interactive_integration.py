@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter
+from scipy.ndimage import percentile_filter
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
@@ -53,6 +54,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
+    QCheckBox,
     QWidget,
 )
 
@@ -119,6 +121,217 @@ def apply_start_cutoff(x: np.ndarray, y: np.ndarray, start_min: float) -> Tuple[
     mask = x >= start_min
     return x[mask], y[mask]
 
+def _make_odd_window(window: int, n: int, minimum: int = 3) -> int:
+    """Return a valid odd window length smaller than the data length."""
+    window = max(minimum, int(window))
+
+    if window % 2 == 0:
+        window += 1
+
+    max_window = n if n % 2 == 1 else n - 1
+
+    if max_window < minimum:
+        return 0
+
+    return min(window, max_window)
+
+
+def estimate_baseline(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    smooth_window: int = 11,
+    baseline_window: int = 101,
+    baseline_percentile: float = 10.0,
+    baseline_smooth_window: int = 101,
+) -> np.ndarray:
+    """
+    Estimate a slowly varying chromatogram baseline.
+
+    1. Smooth short-scale detector noise.
+    2. Use a low rolling percentile to follow the lower envelope.
+    3. Smooth that envelope to remove small wiggles.
+    """
+    if len(y) < 5:
+        return np.zeros_like(y, dtype=float)
+
+    # ------------------------------------------------------------
+    # Step 1: lightly smooth the raw signal.
+    # This is ONLY for baseline estimation.
+    # ------------------------------------------------------------
+    sw = _make_odd_window(smooth_window, len(y))
+
+    if sw >= 5:
+        y_smooth = savgol_filter(
+            y,
+            window_length=sw,
+            polyorder=2,
+        )
+    else:
+        y_smooth = y.copy()
+
+    # ------------------------------------------------------------
+    # Step 2: estimate the lower envelope using a rolling
+    # percentile. This is much less sensitive to peaks than
+    # using the local mean.
+    # ------------------------------------------------------------
+    bw = _make_odd_window(baseline_window, len(y))
+
+    if bw == 0:
+        return np.zeros_like(y, dtype=float)
+
+    baseline_raw = percentile_filter(
+        y_smooth,
+        percentile=float(baseline_percentile),
+        size=bw,
+        mode="nearest",
+    )
+
+    # ------------------------------------------------------------
+    # Step 3: smooth the estimated baseline so detector noise
+    # does not become part of the baseline itself.
+    # ------------------------------------------------------------
+    bs = _make_odd_window(baseline_smooth_window, len(y))
+
+    if bs >= 5:
+        baseline = savgol_filter(
+            baseline_raw,
+            window_length=bs,
+            polyorder=2,
+        )
+    else:
+        baseline = baseline_raw
+
+    return baseline
+
+def find_peak_boundaries(
+    signal: np.ndarray,
+    peaks: np.ndarray,
+    *,
+    search_window: int = 200,
+    smooth_window: int = 11,
+    valley_prominence_fraction: float = 0.02,
+) -> List[Tuple[int, int]]:
+    """
+    Find start/end boundaries independently of the main peak
+    prominence setting.
+
+    For each detected peak, scan left and right for a meaningful
+    local valley in the baseline-corrected signal.
+
+    valley_prominence_fraction is the minimum valley prominence
+    expressed as a fraction of the peak height.
+    """
+
+    if len(peaks) == 0:
+        return []
+
+    # Smooth only for boundary/valley detection.
+    sw = _make_odd_window(smooth_window, len(signal))
+
+    if sw >= 5:
+        search_signal = savgol_filter(
+            signal,
+            window_length=sw,
+            polyorder=2,
+        )
+    else:
+        search_signal = signal.copy()
+
+    boundaries: List[Tuple[int, int]] = []
+
+    for peak in peaks:
+        peak = int(peak)
+
+        peak_height = max(
+            float(search_signal[peak]),
+            0.0,
+        )
+
+        # Valley prominence is relative to this peak.
+        valley_prominence = max(
+            peak_height * float(valley_prominence_fraction),
+            1e-12,
+        )
+
+        # --------------------------------------------------------
+        # LEFT SIDE
+        # --------------------------------------------------------
+        left_start = max(
+            0,
+            peak - int(search_window),
+        )
+
+        left_segment = search_signal[left_start:peak + 1]
+
+        if len(left_segment) >= 3:
+            valleys_left, valley_props_left = find_peaks(
+                -left_segment,
+                prominence=valley_prominence,
+                distance=3,
+            )
+
+            if len(valleys_left) > 0:
+                # Choose the valley closest to the apex.
+                left = left_start + int(
+                    valleys_left[-1]
+                )
+            else:
+                # No significant valley found.
+                # Fall back to the lowest point in the search range.
+                left = left_start + int(
+                    np.argmin(left_segment)
+                )
+        else:
+            left = left_start
+
+        # --------------------------------------------------------
+        # RIGHT SIDE
+        # --------------------------------------------------------
+        right_end = min(
+            len(signal) - 1,
+            peak + int(search_window),
+        )
+
+        right_segment = search_signal[peak:right_end + 1]
+
+        if len(right_segment) >= 3:
+            valleys_right, valley_props_right = find_peaks(
+                -right_segment,
+                prominence=valley_prominence,
+                distance=3,
+            )
+
+            if len(valleys_right) > 0:
+                # Choose the valley closest to the apex.
+                right = peak + int(
+                    valleys_right[0]
+                )
+            else:
+                # No significant valley found.
+                # Fall back to the lowest point in the search range.
+                right = peak + int(
+                    np.argmin(right_segment)
+                )
+        else:
+            right = right_end
+
+        # --------------------------------------------------------
+        # Safety checks
+        # --------------------------------------------------------
+        left = max(
+            0,
+            min(int(left), peak),
+        )
+
+        right = min(
+            len(signal) - 1,
+            max(int(right), peak),
+        )
+
+        boundaries.append((left, right))
+
+    return boundaries
 
 def detect_and_integrate(
     x: np.ndarray,
@@ -128,19 +341,50 @@ def detect_and_integrate(
     prominence: float,
     distance: int,
     width: float,
+    baseline_smooth_window: int,
+    baseline_window: int,
+    baseline_percentile: float,
+    baseline_smooth2_window: int,
+    boundary_window: int,
+    boundary_prominence_fraction: float,
 ) -> List[PeakResult]:
     x2, y2 = apply_start_cutoff(x, y, start_min)
     if len(x2) < 5:
         return []
+    
+    baseline = estimate_baseline(
+        x2,
+        y2,
+        smooth_window=baseline_smooth_window,
+        baseline_window=baseline_window,
+        baseline_percentile=baseline_percentile,
+        baseline_smooth_window=baseline_smooth2_window,
+    )
 
+    corrected = y2 - baseline
+    corrected = np.maximum(corrected, 0.0)
+    
     kwargs = {
         "prominence": float(prominence),
         "distance": max(1, int(distance)),
     }
+
     if width and width > 0:
         kwargs["width"] = float(width)
 
-    peaks, props = find_peaks(y2, **kwargs)
+    # Detect peak apexes.
+    peaks, props = find_peaks(corrected, **kwargs)
+    
+    boundaries = find_peak_boundaries(
+        corrected,
+        peaks,
+        search_window=int(boundary_window),
+        smooth_window=11,
+        valley_prominence_fraction=(
+            float(boundary_prominence_fraction)
+        ),
+    )
+
     if len(peaks) == 0:
         return []
 
@@ -148,25 +392,34 @@ def detect_and_integrate(
     raw_areas = []
 
     for i, p in enumerate(peaks):
-        left = int(props["left_bases"][i])
-        right = int(props["right_bases"][i])
-
+        p = int(p)
+    
+        left, right = boundaries[i]
+    
         if right <= left + 1:
             continue
-
-        xseg = x2[left : right + 1]
-        yseg = y2[left : right + 1]
+    
+        xseg = x2[left:right + 1]
+        yseg = y2[left:right + 1]
+    
         if len(xseg) < 3:
             continue
+    
+        # Use the whole-chromatogram baseline calculated above.
+        baseline_seg = baseline[left:right + 1]
 
-        baseline = np.interp(xseg, [xseg[0], xseg[-1]], [yseg[0], yseg[-1]])
-        corrected = yseg - baseline
-        area = float(np.trapz(corrected, xseg))
+        corrected_peak = yseg - baseline_seg
+        corrected_peak = np.maximum(
+            corrected_peak,
+            0.0,
+        )
 
+        area = float(np.trapz(corrected_peak, xseg))    
         raw_areas.append(area)
+    
         temp_rows.append(
             {
-                "peak_index": int(p),
+                "peak_index": p,
                 "rt_min": float(x2[p]),
                 "height": float(y2[p]),
                 "left_min": float(x2[left]),
@@ -176,10 +429,16 @@ def detect_and_integrate(
         )
 
     total_area = float(np.sum(raw_areas)) if raw_areas else 0.0
+
     results: List[PeakResult] = []
 
     for row in temp_rows:
-        area_percent = 0.0 if total_area == 0 else 100.0 * row["area"] / total_area
+        area_percent = (
+            0.0
+            if total_area == 0
+            else 100.0 * row["area"] / total_area
+        )
+
         results.append(
             PeakResult(
                 peak_index=row["peak_index"],
@@ -194,7 +453,6 @@ def detect_and_integrate(
 
     results.sort(key=lambda r: r.rt_min)
     return results
-
 
 
 class PeakExplorer(QMainWindow):
@@ -281,10 +539,6 @@ class PeakExplorer(QMainWindow):
         self.btn_export = QPushButton("Export peak table...")
         self.btn_save_png = QPushButton("Save PNG...")
         
-        file_btn_row.addWidget(self.btn_choose)
-        file_btn_row.addWidget(self.btn_export)
-        file_btn_row.addWidget(self.btn_save_png)
-        
         self.btn_save_png.clicked.connect(self.save_clean_png)
         file_layout.addLayout(file_btn_row)
 
@@ -299,6 +553,124 @@ class PeakExplorer(QMainWindow):
         
         figure_box = QGroupBox("Figure settings")
         figure_layout = QFormLayout(figure_box)
+        
+        left_layout.addWidget(figure_box)
+        
+        self.shade_toggle = QCheckBox("Shade integrated areas")
+        self.shade_toggle.setChecked(False)
+
+        self.boundary_toggle = QCheckBox("Show peak start/end markers")
+        self.boundary_toggle.setChecked(False)
+
+        figure_layout.addRow("Area shading", self.shade_toggle)
+        figure_layout.addRow("Peak boundaries", self.boundary_toggle)
+
+        left_layout.addWidget(figure_box)
+        
+        baseline_box = QGroupBox("Baseline correction")
+        baseline_layout = QFormLayout(baseline_box)
+        
+        self.baseline_toggle = QCheckBox("Show baseline")
+        self.baseline_toggle.setChecked(True)
+        
+        self.corrected_toggle = QCheckBox("Show corrected signal")
+        self.corrected_toggle.setChecked(False)
+        
+        self.corrected_toggle.stateChanged.connect(
+            self._visual_options_changed
+        )
+        
+        baseline_layout.addRow(
+            "Corrected signal",
+            self.corrected_toggle,
+        )
+        
+        self.baseline_smooth_spin = QSpinBox()
+        self.baseline_smooth_spin.setRange(3, 1001)
+        self.baseline_smooth_spin.setSingleStep(2)
+        self.baseline_smooth_spin.setValue(11)
+        
+        self.baseline_window_spin = QSpinBox()
+        self.baseline_window_spin.setRange(5, 5001)
+        self.baseline_window_spin.setSingleStep(10)
+        self.baseline_window_spin.setValue(101)
+        
+        self.baseline_percentile_spin = QDoubleSpinBox()
+        self.baseline_percentile_spin.setRange(1.0, 50.0)
+        self.baseline_percentile_spin.setSingleStep(1.0)
+        self.baseline_percentile_spin.setValue(10.0)
+        
+        self.baseline_smooth2_spin = QSpinBox()
+        self.baseline_smooth2_spin.setRange(3, 5001)
+        self.baseline_smooth2_spin.setSingleStep(10)
+        self.baseline_smooth2_spin.setValue(101)
+        
+        self.baseline_toggle.stateChanged.connect(
+            self._visual_options_changed
+        )
+        
+        self.baseline_smooth_spin.valueChanged.connect(
+            self._visual_options_changed
+        )
+        
+        self.baseline_window_spin.valueChanged.connect(
+            self._visual_options_changed
+        )
+        
+        self.baseline_percentile_spin.valueChanged.connect(
+            self._visual_options_changed
+        )
+        
+        self.baseline_smooth2_spin.valueChanged.connect(
+            self._visual_options_changed
+        )
+        
+        baseline_layout.addRow(
+            "Show baseline",
+            self.baseline_toggle,
+        )
+        baseline_layout.addRow(
+            "Noise smoothing (points)",
+            self.baseline_smooth_spin,
+        )
+        baseline_layout.addRow(
+            "Baseline window (points)",
+            self.baseline_window_spin,
+        )
+        baseline_layout.addRow(
+            "Baseline percentile (%)",
+            self.baseline_percentile_spin,
+        )
+        baseline_layout.addRow(
+            "Baseline smoothing (points)",
+            self.baseline_smooth2_spin,
+        )
+        
+        left_layout.addWidget(baseline_box)
+        
+        self.boundary_window_spin = QSpinBox()
+        self.boundary_window_spin.setRange(5, 10000)
+        self.boundary_window_spin.setSingleStep(10)
+        self.boundary_window_spin.setValue(200)
+        
+        baseline_layout.addRow(
+            "Boundary search window (points)",
+            self.boundary_window_spin,
+        )
+        
+        self.boundary_prominence_spin = QDoubleSpinBox()
+        self.boundary_prominence_spin.setRange(0.1, 25.0)
+        self.boundary_prominence_spin.setSingleStep(0.5)
+        self.boundary_prominence_spin.setValue(2.0)
+
+        baseline_layout.addRow(
+            "Boundary valley sensitivity (%)",
+            self.boundary_prominence_spin,
+        )        
+        
+        file_btn_row.addWidget(self.btn_choose)
+        file_btn_row.addWidget(self.btn_export)
+        file_btn_row.addWidget(self.btn_save_png)
         
         self.title_edit = QLineEdit("GC-FID Chromatogram")
         self.xlabel_edit = QLineEdit("Retention time (min)")
@@ -415,6 +787,12 @@ class PeakExplorer(QMainWindow):
         self.btn_export.clicked.connect(self.export_peak_table)
         self.btn_update.clicked.connect(self.update_analysis)
         self.btn_clear.clicked.connect(self.clear_all)
+        self.shade_toggle.stateChanged.connect(
+            self._visual_options_changed
+        )
+        self.boundary_toggle.stateChanged.connect(
+            self._visual_options_changed
+            )
 
     def log_message(self, msg: str) -> None:
         self.log.append(msg)
@@ -480,6 +858,29 @@ class PeakExplorer(QMainWindow):
             width = float(self.width_spin.value())
             distance = int(self.dist_spin.value())
             top_n = int(self.topn_spin.value())
+            baseline_smooth_window = int(
+                self.baseline_smooth_spin.value()
+            )
+            
+            baseline_window = int(
+                self.baseline_window_spin.value()
+            )
+            
+            baseline_percentile = float(
+                self.baseline_percentile_spin.value()
+            )
+            
+            baseline_smooth2_window = int(
+                self.baseline_smooth2_spin.value()
+            )
+            boundary_window = int(
+                self.boundary_window_spin.value()
+            )
+            boundary_prominence_fraction = (
+                float(
+                    self.boundary_prominence_spin.value()
+                ) / 100.0
+            )
         except Exception as e:
             self.status.setText(f"Invalid settings: {e}")
             return
@@ -492,6 +893,12 @@ class PeakExplorer(QMainWindow):
                 prominence=prominence,
                 distance=distance,
                 width=width,
+                baseline_smooth_window=baseline_smooth_window,
+                baseline_window=baseline_window,
+                baseline_percentile=baseline_percentile,
+                baseline_smooth2_window=baseline_smooth2_window,
+                boundary_window=boundary_window,
+                boundary_prominence_fraction=boundary_prominence_fraction,
             )
         except Exception as e:
             self.status.setText(f"Peak detection failed: {e}")
@@ -521,54 +928,198 @@ class PeakExplorer(QMainWindow):
             "line_width": self.line_width_spin.value(),
         }
         
-    def _update_plot(self, *, start_min: float, peaks: List[PeakResult]) -> None:
+    def _update_plot(
+        self,
+        *,
+        start_min: float,
+        peaks: List[PeakResult],
+    ) -> None:
         x2, y2 = apply_start_cutoff(self.x, self.y, start_min)
 
         self.ax.clear()
-        self.ax.plot(x2, y2, linewidth=1.0, label="Signal")
+        
+        baseline = estimate_baseline(
+            x2,
+            y2,
+            smooth_window=int(self.baseline_smooth_spin.value()),
+            baseline_window=int(self.baseline_window_spin.value()),
+            baseline_percentile=float(
+                self.baseline_percentile_spin.value()
+            ),
+            baseline_smooth_window=int(
+                self.baseline_smooth2_spin.value()
+            ),
+        )
+        
+        corrected = y2 - baseline
+        corrected = np.maximum(corrected, 0.0)
+        
+        if self.corrected_toggle.isChecked():
+            self.ax.plot(
+                x2,
+                corrected,
+                linewidth=1.0,
+                linestyle="-",
+                label="Baseline-corrected signal",
+            )
 
+        # Main chromatogram
+        self.ax.plot(
+            x2,
+            y2,
+            linewidth=self.line_width_spin.value(),
+            label="Signal",
+        )
+        if self.baseline_toggle.isChecked():
+            self.ax.plot(
+                x2,
+                baseline,
+                linewidth=1.5,
+                linestyle="--",
+                label="Estimated baseline",
+            )
+
+        # --------------------------------------------------------
+        # Visualize each integrated peak
+        # --------------------------------------------------------
+        shaded_label_used = False
+        boundary_label_used = False
+
+        for peak in peaks:
+            left_min = peak.left_min
+            right_min = peak.right_min
+
+            mask = (x2 >= left_min) & (x2 <= right_min)
+
+            if not np.any(mask):
+                continue
+
+            xseg = x2[mask]
+            yseg = y2[mask]
+
+            if len(xseg) < 2:
+                continue
+
+            # Use the same whole-chromatogram baseline used
+            # for the actual area calculation.
+            baseline_seg = baseline[mask]
+
+            # ----------------------------------------------------
+            # Shade integrated area
+            # ----------------------------------------------------
+            if self.shade_toggle.isChecked():
+                y_fill = np.maximum(yseg, baseline_seg)
+
+                self.ax.fill_between(
+                    xseg,
+                    baseline_seg,
+                    y_fill,
+                    alpha=0.30,
+                    label=(
+                        "Integrated area"
+                        if not shaded_label_used
+                        else None
+                    ),
+                )
+                
+                shaded_label_used = True
+
+            # ----------------------------------------------------
+            # Start/end markers
+            # ----------------------------------------------------
+            if self.boundary_toggle.isChecked():
+                left_y = float(np.interp(left_min, x2, y2))
+                right_y = float(np.interp(right_min, x2, y2))
+
+                self.ax.plot(
+                    left_min,
+                    left_y,
+                    marker="o",
+                    markersize=5,
+                    linestyle="None",
+                    label=(
+                        "Peak start/end"
+                        if not boundary_label_used
+                        else None
+                    ),
+                )
+
+                self.ax.plot(
+                    right_min,
+                    right_y,
+                    marker="s",
+                    markersize=5,
+                    linestyle="None",
+                )
+
+                boundary_label_used = True
+
+        # Apex markers
         if peaks:
-            peak_rts = np.array([p.rt_min for p in peaks], dtype=float)
-            peak_heights = np.array([p.height for p in peaks], dtype=float)
-            self.ax.plot(peak_rts, peak_heights, "ro", markersize=2, label="Detected peaks")
+            peak_rts = np.array(
+                [p.rt_min for p in peaks],
+                dtype=float,
+            )
+            peak_heights = np.array(
+                [p.height for p in peaks],
+                dtype=float,
+            )
 
-        self.ax.set_xlabel(self.xlabel_edit.text())
-        self.ax.set_ylabel(self.ylabel_edit.text())
-        self.ax.set_title(self.title_edit.text())
-        self.ax.grid(True, alpha=0.25)
-        self.ax.legend(loc="best")
-        self.canvas.draw_idle()
+            self.ax.plot(
+                peak_rts,
+                peak_heights,
+                "ro",
+                markersize=3,
+                label="Detected peaks",
+            )
+
+        # --------------------------------------------------------
+        # Figure formatting
+        # --------------------------------------------------------
         fig = self._figure_settings()
-        
-        self.ax.clear()
-        self.ax.plot(x2, y2, linewidth=fig["line_width"], label="Signal")
-        fig = self._figure_settings()
-        
+
         self.ax.set_title(
             fig["title"],
             fontsize=fig["title_size"],
             fontname=fig["font"],
         )
-        
+
         self.ax.set_xlabel(
             fig["xlabel"],
             fontsize=fig["axis_size"],
             fontname=fig["font"],
         )
-        
+
         self.ax.set_ylabel(
             fig["ylabel"],
             fontsize=fig["axis_size"],
             fontname=fig["font"],
         )
-        
-        self.ax.tick_params(labelsize=fig["tick_size"])
-        
+
+        self.ax.tick_params(
+            axis="both",
+            labelsize=fig["tick_size"],
+        )
+
         for tick in self.ax.get_xticklabels():
             tick.set_fontname(fig["font"])
-        
+
         for tick in self.ax.get_yticklabels():
             tick.set_fontname(fig["font"])
+
+        self.ax.grid(True, alpha=0.25)
+        self.ax.legend(loc="best")
+
+        self.canvas.draw_idle()
+        
+    def _visual_options_changed(self, _state=None) -> None:
+        if self.x is None or self.y is None:
+            return
+
+        self._update_plot(
+            start_min=float(self.start_spin.value()),
+            peaks=self.current_peaks,
+        )
 
     def _update_table(self, peaks: List[PeakResult], top_n: int) -> None:
         self.table.setRowCount(0)
